@@ -14,6 +14,16 @@ type instruction struct {
 	Code    code
 	A, B, C reg
 	Pos     pos
+	Stmt    bool
+}
+
+// dbgEnv is a persistent map of visible local variable names to stack slots
+// for one point in a debug-compiled function. Newest bindings shadow older
+// ones through the Prev chain.
+type dbgEnv struct {
+	Name string
+	Slot int
+	Prev *dbgEnv
 }
 
 func joinParams(a, b reg) reg      { return (((a + 32768) & 0xffff) << 16) | ((b + 32768) & 0xffff) }
@@ -139,6 +149,78 @@ type compiler struct {
 	Optimize    bool
 	Returns     []int
 	FuncName    string
+
+	// Debug enables statement entry markers (codePass with Stmt=true) and
+	// lexical environment recording for debug sessions.
+	Debug bool
+	// dbgSeq assigns globally unique statement marker ids.
+	dbgSeq int
+	// dbgEnv is the persistent local environment at the next statement marker.
+	dbgEnv *dbgEnv
+	// dbgScope saves dbgEnv across Begin/End pairs.
+	dbgScope []*dbgEnv
+	// dbgEnvs maps marker id to the environment visible just before that
+	// statement executes.
+	dbgEnvs map[reg]*dbgEnv
+	// dbgLines records executable statement lines per source file.
+	dbgLines map[string]map[int]bool
+}
+
+// isDebugStmt reports whether a top-level token is an executable statement
+// that should get a debug entry checkpoint. Declarations of functions,
+// methods, types, packages and imports take effect without a business
+// statement executing and are not stoppable themselves.
+func isDebugStmt(t *token) bool {
+	switch t.Symbol {
+	case "function", "method", "type", "package", "import", "init", "~":
+		return false
+	default:
+		return true
+	}
+}
+
+// dbgMarker emits a statement entry marker: a no-op instruction carrying the
+// statement start position and a unique id. Markers survive optimization
+// because no optimizer pattern touches codePass.
+func (c *compiler) dbgMarker(t *token) instruction {
+	id := reg(c.dbgSeq)
+	c.dbgSeq++
+	if c.dbgEnvs == nil {
+		c.dbgEnvs = map[reg]*dbgEnv{}
+	}
+	c.dbgEnvs[id] = c.dbgEnv
+	if c.dbgLines == nil {
+		c.dbgLines = map[string]map[int]bool{}
+	}
+	lines := c.dbgLines[t.Pos.Filename]
+	if lines == nil {
+		lines = map[int]bool{}
+		c.dbgLines[t.Pos.Filename] = lines
+	}
+	lines[t.Pos.Line] = true
+	return instruction{Code: codePass, Stmt: true, A: id,
+		Pos: newPos(c.Globals, t.Pos.Filename, c.FuncName, t.Pos.Line, t.Pos.Column)}
+}
+
+// dbgBind records a local variable becoming visible to following statements.
+func (c *compiler) dbgBind(name string, slot int) {
+	if !c.Debug || name == "_" {
+		return
+	}
+	c.dbgEnv = &dbgEnv{Name: name, Slot: slot, Prev: c.dbgEnv}
+}
+
+// compileStmts compiles an ordered list of statements, prepending an entry
+// marker to each executable statement in debug builds.
+func (c *compiler) compileStmts(tokens []*token) []instruction {
+	var res []instruction
+	for _, t := range tokens {
+		if c.Debug && isDebugStmt(t) {
+			res = append(res, c.dbgMarker(t))
+		}
+		res = append(res, c.compile(t)...)
+	}
+	return res
 }
 
 func compilePkgs(g *lookup, pkgs []*token, optimize bool) (ins []instruction, slots int, err error) {
@@ -177,7 +259,7 @@ func (c *compiler) run(tok *token) (ins []instruction, slots int, err error) {
 			err = fmt.Errorf("%v: %v", c.cur.Pos, r)
 		}
 	}()
-	res := c.optimize(c.compileAll(tok.Tokens))
+	res := c.optimize(c.compileStmts(tok.Tokens))
 	return res, c.Locals.Cap(), nil
 }
 
@@ -187,6 +269,9 @@ func (c *compiler) isLocal() bool {
 
 func (c *compiler) Begin() {
 	c.scope = append(c.scope, c.Locals.Len())
+	if c.Debug {
+		c.dbgScope = append(c.dbgScope, c.dbgEnv)
+	}
 }
 
 func (c *compiler) Shadow(key string) int {
@@ -202,6 +287,10 @@ func (c *compiler) End() {
 	a := c.scope[len(c.scope)-1]
 	c.scope = c.scope[:len(c.scope)-1]
 	c.Locals.Drop(b - a)
+	if c.Debug {
+		c.dbgEnv = c.dbgScope[len(c.dbgScope)-1]
+		c.dbgScope = c.dbgScope[:len(c.dbgScope)-1]
+	}
 	// for i := 0; i < b-a; i++ {
 	// 	c.Locals.Pop()
 	// }
@@ -367,6 +456,7 @@ func (c *compiler) compile(tok *token) []instruction {
 			if c.isLocal() {
 				code = codeLocalSet
 				idx = c.Shadow(key)
+				c.dbgBind(target.Text, idx)
 			} else {
 				lookup := c.Globals
 				key = c.expPrefix(key)
@@ -389,6 +479,7 @@ func (c *compiler) compile(tok *token) []instruction {
 				} else if c.isLocal() {
 					code = codeLocalZero
 					idx = c.Shadow(key)
+					c.dbgBind(target.Text, idx)
 				} else {
 					key = c.expPrefix(key)
 					idx = lookup.Index(key)
@@ -409,6 +500,7 @@ func (c *compiler) compile(tok *token) []instruction {
 			} else if c.isLocal() {
 				code = codeLocalSet
 				idx = c.Shadow(key)
+				c.dbgBind(target.Text, idx)
 			} else {
 				key = c.expPrefix(key)
 				idx = lookup.Index(key)
@@ -515,7 +607,8 @@ func (c *compiler) compile(tok *token) []instruction {
 			types = append(types, t)
 		}
 		for _, arg := range tok.Tokens[funcArguments].Tokens {
-			c.Locals.Index(arg.Text)
+			slot := c.Locals.Index(arg.Text)
+			c.dbgBind(arg.Text, slot)
 		}
 		if arguments > 0 && tok.Tokens[funcArguments].Tokens[arguments-1].Tokens[0].Text == "..." {
 			arguments = -arguments
@@ -537,7 +630,9 @@ func (c *compiler) compile(tok *token) []instruction {
 		c.Returns = c.Returns[:len(c.Returns)-1]
 		c.End()
 		c.Locals = tmp
-	case "block", ",":
+	case "block":
+		res = append(res, c.compileStmts(tok.Tokens)...)
+	case ",":
 		res = append(res, c.compileAll(tok.Tokens)...)
 	case "return":
 		if len(tok.Tokens) == 1 && tok.Tokens[0].Symbol == "call" {
@@ -630,14 +725,14 @@ func (c *compiler) compile(tok *token) []instruction {
 
 		var out []instruction
 		c.Begin()
-		defBlock := c.optimize(c.compileAll(tok.Tokens[switchDefault].Tokens))
+		defBlock := c.optimize(c.compileStmts(tok.Tokens[switchDefault].Tokens))
 		c.End()
 		for i := len(tok.Tokens[switchCases].Tokens) - 1; i >= 0; i-- {
 			cs := tok.Tokens[switchCases].Tokens[i]
 			const caseStmt, caseBlock = 0, 1
 			csStmt := c.optimize(c.compile(cs.Tokens[caseStmt]))
 			c.Begin()
-			csBlock := c.optimize(c.compileAll(cs.Tokens[caseBlock].Tokens))
+			csBlock := c.optimize(c.compileStmts(cs.Tokens[caseBlock].Tokens))
 			for n, ins := range csBlock {
 				switch ins.Code {
 				case codeBreak:
@@ -736,6 +831,8 @@ func (c *compiler) compile(tok *token) []instruction {
 		r := c.Locals.Index(tok.Pos.String())
 		k := c.Locals.Index(tok.Tokens[rangeKey].Text)
 		v := c.Locals.Index(tok.Tokens[rangeValue].Text)
+		c.dbgBind(tok.Tokens[rangeKey].Text, k)
+		c.dbgBind(tok.Tokens[rangeValue].Text, v)
 		block := c.optimize(c.compile(tok.Tokens[rangeBlock]))
 		for n, ins := range block {
 			switch ins.Code {

@@ -16,6 +16,15 @@ type frame struct {
 	N     int
 }
 
+// dbgAct records a paused script caller activation so a debug session can
+// rebuild its frames: the caller's codes, register base and the statement
+// marker that was executing when the call happened.
+type dbgAct struct {
+	codes []instruction
+	baseN int
+	stmt  int
+}
+
 type VM struct {
 	stack   []Value
 	globals *lookup
@@ -23,6 +32,13 @@ type VM struct {
 
 	backtrace []pos
 	frame     frame
+
+	// Debug-only state. nil for ordinary execution, keeping Eval/Call/Load
+	// on their original code paths.
+	dbg      *debugger
+	dbgActs  []dbgAct
+	dbgStmt  int
+	dbgActID int
 }
 
 func (v *VM) Set(key string, value Value) { v.globals.Set(key, value) }
@@ -227,12 +243,70 @@ func (v *VM) Eval(sys fs.FS, fname, input string, options ...RunOption) (rets []
 	return rets, nil
 }
 
+// Debug starts a single-source statement-stepping debug session for input.
+// Unlike Eval, execution is suspended at the entry of the first statement
+// that actually runs, before that statement has any effect. Imported
+// packages are compiled and executed to completion first, exactly as Eval
+// does. A compile error returns nil and the error without executing any
+// statement of the main source. The owner VM's globals and stdout are shared,
+// so a completed or aborted session leaves the same effects a plain Eval
+// would have produced.
+func (v *VM) Debug(sys fs.FS, fname, input string) (session *DebugSession, err error) {
+	const pkgName = "main"
+	tokens, err := tokenize(fname, input)
+	if err != nil {
+		return nil, fmt.Errorf("error in tokenize: %w", err)
+	}
+	tree, err := parse(tokens)
+	if err != nil {
+		return nil, fmt.Errorf("error in parse: %w", err)
+	}
+	pkgs, err := loadImports(sys, "", tree)
+	if err != nil {
+		return nil, fmt.Errorf("error in loadImports: %w", err)
+	}
+	// Imported packages are compiled and executed first, exactly as Eval
+	// does; the debugged source is compiled afterwards and is the only
+	// code that participates in the debug session.
+	importCodes, importSlots, err := compilePkgs(v.globals, pkgs[:len(pkgs)-1], true)
+	if err != nil {
+		return nil, fmt.Errorf("error in compile (imports): %w", err)
+	}
+	if _, err = v.run(importCodes, importSlots); err != nil {
+		return nil, fmt.Errorf("error in run (imports): %w", err)
+	}
+	cmp := &compiler{
+		Globals:     v.globals,
+		Locals:      newLookup(),
+		Imports:     map[string]string{},
+		Optimize:    true,
+		Debug:       true,
+		PackageName: pkgName,
+		ExportName:  pkgName,
+	}
+	codes, slots, err := cmp.run(pkgs[len(pkgs)-1])
+	if err != nil {
+		return nil, fmt.Errorf("error in compile: %w", err)
+	}
+	return newDebugSession(v, fname, codes, slots, cmp.dbgEnvs, cmp.dbgLines), nil
+}
+
 func mkFunc(args, rets, slots int, tokens []instruction) func(v *VM) {
 	empty := make([]Value, slots-args)
 	codes := tokens[args+rets:]
 	return func(v *VM) {
 		v.backtrace = append(v.backtrace, v.frame.Codes[v.frame.N].Pos)
 		prev := v.frame
+		prevActID := v.dbgActID
+		if v.dbg != nil {
+			v.dbgActs = append(v.dbgActs, dbgAct{codes: prev.Codes, baseN: prev.BaseN, stmt: v.dbgStmt})
+			v.dbg.actSeq++
+			v.dbgActID = v.dbg.actSeq
+			defer func() {
+				v.dbgActs = v.dbgActs[:len(v.dbgActs)-1]
+				v.dbgActID = prevActID
+			}()
+		}
 		v.frame = frame{
 			Codes: codes,
 			BaseN: len(v.stack) - args,

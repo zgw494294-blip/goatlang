@@ -9,6 +9,10 @@ func (v *VM) exec() {
 	baseN := v.frame.BaseN
 	l := len(codes)
 	for v.frame.N = 0; v.frame.N < l; v.frame.N++ {
+		ins := &codes[v.frame.N]
+		if v.dbg != nil {
+			v.dbg.tick(v, ins)
+		}
 		switch codes[v.frame.N].Code {
 		case codePush, codeGlobalRef:
 			v.stack = append(v.stack, newUntypedInt(int(codes[v.frame.N].A)))
@@ -480,6 +484,11 @@ func (v *VM) exec() {
 
 		default: // TODO: comment out
 			panic(fmt.Sprintf("unknown code: %v", v.frame.Codes[v.frame.N].Code))
+		}
+		if v.dbg != nil {
+			// Use the pre-dispatch instruction: codeFunc advances N over
+			// its body, so codes[N] here would be an unrelated instruction.
+			v.dbg.didBind(ins.Code, int(ins.A))
 		}
 	}
 }
