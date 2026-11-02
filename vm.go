@@ -14,6 +14,18 @@ type frame struct {
 	BaseN int
 	Codes []instruction
 	N     int
+
+	// resumable sessions only
+	Unit int
+	info *frameInfo
+}
+
+// frameInfo records how a script function call frame was entered, so the
+// epilogue can be rebuilt after a resume.
+type frameInfo struct {
+	reg   *funcReg
+	TopN  int
+	XRets int
 }
 
 type VM struct {
@@ -23,6 +35,20 @@ type VM struct {
 
 	backtrace []pos
 	frame     frame
+
+	// resumable session execution only
+	resumable bool
+	prog      *program
+	frames    []frame
+}
+
+// suspendPanic unwinds the exec loop to the running Session.Resume call.
+type suspendPanic struct{}
+
+func (v *VM) suspend() {
+	// Resume must continue after the checkpoint call, never re-executing it.
+	v.frame.N++
+	panic(suspendPanic{})
 }
 
 func (v *VM) Set(key string, value Value) { v.globals.Set(key, value) }
@@ -227,28 +253,146 @@ func (v *VM) Eval(sys fs.FS, fname, input string, options ...RunOption) (rets []
 	return rets, nil
 }
 
-func mkFunc(args, rets, slots int, tokens []instruction) func(v *VM) {
+func mkFunc(args, rets, slots int, tokens []instruction, unit, fnID int) func(v *VM) {
 	empty := make([]Value, slots-args)
 	codes := tokens[args+rets:]
 	return func(v *VM) {
-		v.backtrace = append(v.backtrace, v.frame.Codes[v.frame.N].Pos)
-		prev := v.frame
-		v.frame = frame{
-			Codes: codes,
-			BaseN: len(v.stack) - args,
+		if !v.resumable {
+			v.backtrace = append(v.backtrace, v.frame.Codes[v.frame.N].Pos)
+			prev := v.frame
+			v.frame = frame{
+				Codes: codes,
+				BaseN: len(v.stack) - args,
+			}
+			for i := 0; i < args; i++ {
+				v.stack[len(v.stack)-args+i] = v.stack[len(v.stack)-args+i].assign(Type(tokens[i].A))
+			}
+			v.stack = append(v.stack, empty...)
+			topN := len(v.stack)
+			v.exec()
+			v.stack = append(v.stack[:v.frame.BaseN], v.stack[topN:]...)
+			for i := 0; i < rets; i++ {
+				v.stack[len(v.stack)-rets+i] = v.stack[len(v.stack)-rets+i].assign(Type(tokens[args+i].A))
+			}
+			v.frame = prev
+			v.backtrace = v.backtrace[:len(v.backtrace)-1]
+			return
 		}
-		for i := 0; i < args; i++ {
-			v.stack[len(v.stack)-args+i] = v.stack[len(v.stack)-args+i].assign(Type(tokens[i].A))
+		// Resumable sessions use an explicit frame chain (v.frames) so the
+		// full call stack can be snapshotted without any Go frames. The
+		// function identity is captured here, not read from the caller
+		// frame (this closure also runs behind bound-method wrappers).
+		reg := v.prog.lookup(unit, fnID)
+		v.enterScript(reg, len(v.stack)-args)
+	}
+}
+
+// enterScript pushes a new script function frame. baseN is the stack index
+// where the call arguments start.
+func (v *VM) enterScript(reg *funcReg, baseN int) {
+	caller := v.frame
+	v.backtrace = append(v.backtrace, caller.Codes[caller.N].Pos)
+	for i := 0; i < reg.nargs; i++ {
+		v.stack[baseN+i] = v.stack[baseN+i].assign(Type(reg.types[i].A))
+	}
+	v.stack = append(v.stack, make([]Value, reg.slots-reg.nargs)...)
+	v.frames = append(v.frames, caller)
+	v.frame = frame{
+		Unit:  reg.unit,
+		Codes: reg.body,
+		BaseN: baseN,
+		N:     0,
+		info:  &frameInfo{reg: reg, TopN: len(v.stack)},
+	}
+}
+
+// invoke calls ft in a resumable session VM. variadic mirrors the wrapping
+// done by call(); fixed mirrors callReady for f(slice...) calls.
+func (v *VM) invoke(ft *funcT, xArgs, xRets int, variadic bool) {
+	if variadic && ft.Variadic {
+		nVarArgs := xArgs - ft.Args + 1
+		varArgs := make([]Value, nVarArgs)
+		end := len(v.stack) - nVarArgs
+		copy(varArgs, v.stack[end:])
+		v.stack = v.stack[:end]
+		v.stack = append(v.stack, NewSlice(ft.VariadicType, varArgs))
+		xArgs = xArgs - nVarArgs + 1
+	}
+	if xArgs != ft.Args {
+		panic("incorrect args")
+	}
+	top := len(v.stack) - xArgs
+	if ft.scriptFunc() {
+		reg := v.prog.lookup(ft.Unit, ft.FuncID)
+		v.enterScript(reg, top)
+		v.frame.info.XRets = xRets
+		return
+	}
+	// Native bindings run immediately. A bound-method wrapper may itself
+	// enter a script frame (via f.Value); in that case the driver continues
+	// with the new frame.
+	nf := len(v.frames)
+	ft.Value(v)
+	if len(v.frames) > nf {
+		v.frame.info.XRets = xRets
+		return
+	}
+	v.trimReturns(top, xRets)
+}
+
+func (v *VM) trimReturns(top, xRets int) {
+	fRets := len(v.stack) - top
+	if fRets < xRets {
+		panic("incorrect returns")
+	} else if fRets > xRets {
+		v.stack = v.stack[:top+xRets]
+	}
+}
+
+// finishFrame runs a completed script frame's epilogue: drop locals, assign
+// declared return types, and enforce the number of returns expected at the
+// call site.
+func (v *VM) finishFrame() {
+	info := v.frame.info
+	reg := info.reg
+	v.stack = append(v.stack[:v.frame.BaseN], v.stack[info.TopN:]...)
+	for i := 0; i < reg.rets; i++ {
+		v.stack[len(v.stack)-reg.rets+i] = v.stack[len(v.stack)-reg.rets+i].assign(Type(reg.types[reg.nargs+i].A))
+	}
+	v.trimReturns(v.frame.BaseN, info.XRets)
+}
+
+// newRange builds range iteration state. Resumable sessions use concrete
+// iterator values whose position can be snapshotted and restored.
+func (v *VM) newRange(a Value) Value {
+	if !v.resumable {
+		if a.value != nil {
+			return newNext(a.Range())
 		}
-		v.stack = append(v.stack, empty...)
-		topN := len(v.stack)
-		v.exec()
-		v.stack = append(v.stack[:v.frame.BaseN], v.stack[topN:]...)
-		for i := 0; i < rets; i++ {
-			v.stack[len(v.stack)-rets+i] = v.stack[len(v.stack)-rets+i].assign(Type(tokens[args+i].A))
+		return newNext(nilRange())
+	}
+	if a.value == nil {
+		return Value{t: typeNext, value: &sliceNext{}}
+	}
+	switch s := a.value.(type) {
+	case *sliceT:
+		return Value{t: typeNext, value: &sliceNext{S: a}}
+	case stringT:
+		return Value{t: typeNext, value: &stringNext{R: []rune(string(s))}}
+	case *stringMap:
+		keys := make([]Value, 0, len(s.keys))
+		for _, k := range s.keys {
+			keys = append(keys, String(k))
 		}
-		v.frame = prev
-		v.backtrace = v.backtrace[:len(v.backtrace)-1]
+		return Value{t: typeNext, value: &mapNext{M: a, Keys: keys}}
+	case *numericMap:
+		keys := make([]Value, 0, len(s.keys))
+		for _, k := range s.keys {
+			keys = append(keys, Value{t: s.keyType, num: k})
+		}
+		return Value{t: typeNext, value: &mapNext{M: a, Keys: keys}}
+	default:
+		return newNext(a.Range())
 	}
 }
 

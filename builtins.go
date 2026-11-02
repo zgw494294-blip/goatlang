@@ -172,6 +172,7 @@ func loadStrings(g *lookup) {
 }
 
 const builtinYield = "builtin.__yield"
+const builtinCheckpoint = "builtin.checkpoint"
 
 func loadBuiltin(g *lookup) {
 	g.Set("builtin.__type", NewFunc(1, 1, func(v *VM) { a := get1v(v); set1v(v, String(a.t.str(g))) }))
@@ -184,6 +185,13 @@ func loadBuiltin(g *lookup) {
 		return nil
 	}))
 	g.Set(builtinYield, NewFunc(0, 0, func(v *VM) {}))
+	// checkpoint is a no-op in ordinary Eval/Load runs; inside a resumable
+	// Session it suspends execution at the call site.
+	g.Set(builtinCheckpoint, NewFunc(0, 0, func(v *VM) {
+		if v.resumable {
+			v.suspend()
+		}
+	}))
 }
 
 func loadTime(g *lookup) {

@@ -216,6 +216,26 @@ type funcT struct {
 	Variadic     bool
 	VariadicType Type
 	Value        func(v *VM)
+
+	// Native marks functions installed through NewFunc; they cannot be
+	// serialized as code and must be re-installed by name to restore.
+	Native bool
+	// Unit/FuncID identify script functions inside a prepared program.
+	Unit   int
+	FuncID int
+	// Bind is set for bound methods produced by newMethod.
+	Bind *boundInfo
+}
+
+type boundInfo struct {
+	Receiver Value
+	Inner    *funcT
+}
+
+// scriptFunc reports whether f is VM-defined function (vs a native binding
+// or a bound-method wrapper).
+func (f *funcT) scriptFunc() bool {
+	return !f.Native && f.Bind == nil
 }
 
 func (v Value) getFunc() *funcT {
@@ -308,6 +328,9 @@ func NewFunc[F func(vm *VM) | func(vm *VM) Value | func(vm *VM, args []Value) | 
 			vm.stack = vm.stack[:i]
 			vm.stack = append(vm.stack, f(vm, a[:argc-1], a[argc-1].data()...)...)
 		})
+	}
+	if res.value != nil {
+		res.value.(*funcT).Native = true
 	}
 	return res
 }
@@ -728,11 +751,75 @@ func (s stringT) SetAttr(k string, v Value)   { panic("unsupported") }
 
 type nextT struct {
 	Object
-	next func() (Value, Value, bool)
+	fn func() (Value, Value, bool)
+}
+
+func (n *nextT) next() (Value, Value, bool) { return n.fn() }
+
+// iterator is the common interface behind range iteration state.
+type iterator interface {
+	next() (Value, Value, bool)
 }
 
 func (v Value) next() (Value, Value, bool) {
-	return v.value.(*nextT).next()
+	return v.value.(iterator).next()
+}
+
+// sliceNext is the resumable iterator state for ranging over a slice
+// (or a nil slice when S is nil).
+type sliceNext struct {
+	Object
+	S Value
+	N int
+}
+
+func (it *sliceNext) next() (Value, Value, bool) {
+	if it.S.value == nil {
+		return Nil(), Nil(), false
+	}
+	r := it.S.value.(*sliceT).data
+	if it.N >= len(r) {
+		return Nil(), Nil(), false
+	}
+	k, v := Int(it.N), r[it.N]
+	it.N++
+	return k, v, true
+}
+
+// stringNext is the resumable iterator state for ranging over a string.
+type stringNext struct {
+	Object
+	R []rune
+	N int
+}
+
+func (it *stringNext) next() (Value, Value, bool) {
+	if it.N >= len(it.R) {
+		return Nil(), Nil(), false
+	}
+	k, v := Int(it.N), Int32(it.R[it.N])
+	it.N++
+	return k, v, true
+}
+
+// mapNext is the resumable iterator state for ranging over a map. Keys is the
+// key snapshot taken when iteration started, preserving continuation order.
+type mapNext struct {
+	Object
+	M    Value
+	Keys []Value
+	N    int
+}
+
+func (it *mapNext) next() (Value, Value, bool) {
+	for it.N < len(it.Keys) {
+		k := it.Keys[it.N]
+		it.N++
+		if v, ok := it.M.Get(k); ok {
+			return k, v, true
+		}
+	}
+	return Nil(), Nil(), false
 }
 
 type sliceT struct {
@@ -1048,7 +1135,7 @@ func newMethod(obj Value, f *funcT) Value {
 	if f.Variadic {
 		vArgs = -vArgs
 	}
-	return newFunc(vArgs, f.Rets, func(v *VM) {
+	res := newFunc(vArgs, f.Rets, func(v *VM) {
 		args := make([]Value, xArgs)
 		copy(args, v.stack[len(v.stack)-xArgs:])
 		v.stack = v.stack[:len(v.stack)-xArgs]
@@ -1056,6 +1143,9 @@ func newMethod(obj Value, f *funcT) Value {
 		v.stack = append(v.stack, args...)
 		f.Value(v)
 	})
+	ft := res.value.(*funcT)
+	ft.Bind = &boundInfo{Receiver: obj, Inner: f}
+	return res
 }
 
 func (s *structT) SetIndex(k int, v Value) {
@@ -1069,7 +1159,7 @@ func nilRange() func() (Value, Value, bool) {
 }
 
 func newNext(next func() (Value, Value, bool)) Value {
-	return Value{t: typeNext, value: &nextT{next: next}}
+	return Value{t: typeNext, value: &nextT{fn: next}}
 }
 
 func (v Value) addField(key string, idx int, val Value) {
